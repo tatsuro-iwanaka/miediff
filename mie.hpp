@@ -7,6 +7,9 @@
 #include <Eigen/Dense>
 #include "autodiff.hpp"
 
+namespace miediff
+{
+
 inline std::vector<std::vector<double>> computeGaussLegendreQuadratureNodeWeight(int degree)
 {
 	Eigen::MatrixXd J = Eigen::MatrixXd::Zero(degree, degree);
@@ -693,366 +696,518 @@ template <typename T> inline std::vector<std::vector<std::vector<T>>> generatePo
 	return {size_distribution, weight};
 }
 
-inline Eigen::MatrixXd computeDeltaMieJacobian(int n_theta, double wavelength, double r, std::complex<double> index, Eigen::VectorXd& y_val)
+struct DiffFlags
 {
-	Eigen::MatrixXd Jacobian;
+	// Delta (Single Particle)
+	bool delta_r = true;
 
-	autodiff::dual<double> wl_ad(wavelength, 0.0); 
-	autodiff::complex<autodiff::dual<double>> index_ad = index; 
+	// Log-Normal
+	bool lnd_r_g = true;
+	bool lnd_sigma_g = true;
 
-	int n_y = 3 + n_theta; // 状態ベクトルの次元数 (scs, acs, ecs, P(theta))
-	int n_x = 1; // パラメータの数 (r_g, sigma_g)
+	// Rectangular
+	bool rect_r_mean = true;
+	bool rect_width = true;
+
+	// Gamma
+	bool gd_a = true;
+	bool gd_b = true;
+
+	// Modified Gamma
+	bool mgd_r_c = true;
+	bool mgd_alpha = true;
+	bool mgd_gamma = true;
+
+	// Power Law
+	bool pld_delta = true;
+	bool pld_r1 = true;
+	bool pld_r2 = true;
+
+	// Refractive Index
+	bool n_r = false;
+	bool n_i = false;
+};
+
+inline Eigen::MatrixXd computeDeltaMieJacobian(int n_theta, double wavelength, double r, std::complex<double> index, Eigen::VectorXd& y_val, const DiffFlags& diff_flags = {})
+{
+	int n_y = 3 + n_theta;
+	int n_x = (diff_flags.delta_r ? 1 : 0) + (diff_flags.n_r ? 1 : 0) + (diff_flags.n_i ? 1 : 0);
 
 	y_val.resize(n_y);
-	Jacobian.resize(n_y, n_x);
+	Eigen::MatrixXd Jacobian = Eigen::MatrixXd::Zero(n_y, n_x);
+	autodiff::dual<double> wl_ad(wavelength, 0.0);
 
-	// r に対するヤコビアン (第0列)
-	autodiff::dual<double> r_ad(r, 1.0);
-	
-	autodiff::dual<double> scs, acs, ecs;
-	std::vector<std::vector<autodiff::dual<double>>> P;
-
-	computeMieScattering(n_theta, r_ad, wl_ad, index_ad, scs, acs, ecs, P);
-
-	y_val(0) = scs.val; Jacobian(0, 0) = scs.der;
-	y_val(1) = acs.val; Jacobian(1, 0) = acs.der;
-	y_val(2) = ecs.val; Jacobian(2, 0) = ecs.der;
-
-	for(int i = 0; i < n_theta; ++i)
+	auto run_pass = [&](double r_seed, double nr_seed, double ni_seed, int current_col)
 	{
-		y_val(3 + i) = P[i][1].val;
-		Jacobian(3 + i, 0) = P[i][1].der;
+		autodiff::dual<double> r_ad(r, r_seed);
+		autodiff::dual<double> m_re_ad(index.real(), nr_seed);
+		autodiff::dual<double> m_im_ad(index.imag(), ni_seed);
+		autodiff::complex<autodiff::dual<double>> index_ad(m_re_ad, m_im_ad);
+
+		autodiff::dual<double> scs, acs, ecs;
+		std::vector<std::vector<autodiff::dual<double>>> P;
+
+		computeMieScattering(n_theta, r_ad, wl_ad, index_ad, scs, acs, ecs, P);
+
+		if (current_col <= 0)
+		{
+			y_val(0) = scs.val;
+			y_val(1) = acs.val;
+			y_val(2) = ecs.val;
+
+			for (int i = 0; i < n_theta; ++i)
+			{
+				y_val(3 + i) = P[i][1].val;
+			}
+		}
+
+		if(current_col >= 0)
+		{
+			Jacobian(0, current_col) = scs.der;
+			Jacobian(1, current_col) = acs.der;
+			Jacobian(2, current_col) = ecs.der;
+
+			for (int i = 0; i < n_theta; ++i)
+			{
+				Jacobian(3 + i, current_col) = P[i][1].der;
+			}
+		}
+	};
+
+	if (n_x == 0)
+	{
+		run_pass(0.0, 0.0, 0.0, -1);
+
+		return Jacobian;
+	}
+
+	int col = 0;
+
+	if (diff_flags.delta_r)
+	{
+		run_pass(1.0, 0.0, 0.0, col++);
+	}
+
+	if (diff_flags.n_r)
+	{
+		run_pass(0.0, 1.0, 0.0, col++);
+	}
+
+	if (diff_flags.n_i)
+	{
+		run_pass(0.0, 0.0, 1.0, col++);
 	}
 
 	return Jacobian;
 }
 
-inline Eigen::MatrixXd computeLogNormalMieJacobian(int n_theta, double wavelength, double r_g, double sigma_g, std::complex<double> index, Eigen::VectorXd& y_val)
+inline Eigen::MatrixXd computeLogNormalMieJacobian(int n_theta, int n_radius, double wavelength, double r_g, double sigma_g, std::complex<double> index, Eigen::VectorXd& y_val, const DiffFlags& diff_flags = {})
 {
-	Eigen::MatrixXd Jacobian;
-
-	autodiff::dual<double> wl_ad(wavelength, 0.0); 
-	autodiff::complex<autodiff::dual<double>> index_ad = index;
-
 	int n_y = 3 + n_theta;
-	int n_x = 2;
+	int n_x = (diff_flags.lnd_r_g ? 1 : 0) + (diff_flags.lnd_sigma_g ? 1 : 0) + (diff_flags.n_r ? 1 : 0) + (diff_flags.n_i ? 1 : 0);
 
 	y_val.resize(n_y);
-	Jacobian.resize(n_y, n_x);
 
-	// r_g に対するヤコビアン (第0列)
-	autodiff::dual<double> rg_ad_1(r_g, 1.0);
-	autodiff::dual<double> sig_ad_1(sigma_g, 0.0);
-	
-	autodiff::dual<double> scs1, acs1, ecs1;
-	std::vector<std::vector<autodiff::dual<double>>> P1;
+	Eigen::MatrixXd Jacobian = Eigen::MatrixXd::Zero(n_y, n_x);
+	autodiff::dual<double> wl_ad(wavelength, 0.0);
 
-	auto sd1 = generateLogNormalSizeDistribution(n_theta, rg_ad_1, sig_ad_1);
-	computeMieScatteringSizeDistribution(n_theta, wl_ad, sd1[1], index_ad, scs1, acs1, ecs1, P1);
-
-	y_val(0) = scs1.val;
-	y_val(1) = acs1.val;
-	y_val(2) = ecs1.val;
-
-	Jacobian(0, 0) = scs1.der;
-	Jacobian(1, 0) = acs1.der;
-	Jacobian(2, 0) = ecs1.der;
-
-	for(int i = 0; i < n_theta; ++i)
+	auto run_pass = [&](double rg_s, double sg_s, double nr_s, double ni_s, int col)
 	{
-		y_val(3 + i) = P1[i][1].val;
-		Jacobian(3 + i, 0) = P1[i][1].der;
+		autodiff::dual<double> rg_ad(r_g, rg_s);
+		autodiff::dual<double> sig_ad(sigma_g, sg_s);
+		autodiff::dual<double> m_re_ad(index.real(), nr_s);
+		autodiff::dual<double> m_im_ad(index.imag(), ni_s);
+		autodiff::complex<autodiff::dual<double>> index_ad(m_re_ad, m_im_ad);
+
+		auto sd = generateLogNormalSizeDistribution(n_radius, rg_ad, sig_ad);
+		autodiff::dual<double> scs, acs, ecs;
+		std::vector<std::vector<autodiff::dual<double>>> P;
+		computeMieScatteringSizeDistribution(n_theta, wl_ad, sd[1], index_ad, scs, acs, ecs, P);
+
+		if (col <= 0)
+		{
+			y_val(0) = scs.val;
+			y_val(1) = acs.val;
+			y_val(2) = ecs.val;
+
+			for (int i = 0; i < n_theta; ++i)
+			{
+				y_val(3 + i) = P[i][1].val;
+			}
+		}
+
+		if (col >= 0)
+		{
+			Jacobian(0, col) = scs.der;
+			Jacobian(1, col) = acs.der;
+			Jacobian(2, col) = ecs.der;
+
+			for (int i = 0; i < n_theta; ++i)
+			{
+				Jacobian(3 + i, col) = P[i][1].der;
+			}
+		}
+	};
+
+	if (n_x == 0)
+	{
+		run_pass(0.0, 0.0, 0.0, 0.0, -1);
+		
+		return Jacobian;
 	}
 
-	// sigma_g に対するヤコビアン (第1列)
-	autodiff::dual<double> rg_ad_2(r_g, 0.0);
-	autodiff::dual<double> sig_ad_2(sigma_g, 1.0);
-	
-	autodiff::dual<double> scs2, acs2, ecs2;
-	std::vector<std::vector<autodiff::dual<double>>> P2;
+	int c = 0;
 
-	auto sd2 = generateLogNormalSizeDistribution(n_theta, rg_ad_2, sig_ad_2);
-	computeMieScatteringSizeDistribution(n_theta, wl_ad, sd2[1], index_ad, scs2, acs2, ecs2, P2);
-
-	Jacobian(0, 1) = scs2.der;
-	Jacobian(1, 1) = acs2.der;
-	Jacobian(2, 1) = ecs2.der;
-
-	for(int i = 0; i < n_theta; ++i)
+	if (diff_flags.lnd_r_g)
 	{
-		Jacobian(3 + i, 1) = P2[i][1].der;
+		run_pass(1.0, 0.0, 0.0, 0.0, c++);
+	}
+
+	if (diff_flags.lnd_sigma_g)
+	{
+		run_pass(0.0, 1.0, 0.0, 0.0, c++);
+	}
+
+	if (diff_flags.n_r)
+	{
+		run_pass(0.0, 0.0, 1.0, 0.0, c++);
+	}
+
+	if (diff_flags.n_i)
+	{
+		run_pass(0.0, 0.0, 0.0, 1.0, c++);
+	}
+
+
+	return Jacobian;
+}
+
+inline Eigen::MatrixXd computeRectangularMieJacobian(int n_theta, int n_radius, double wavelength, double r_mean, double width, std::complex<double> index, Eigen::VectorXd& y_val, const DiffFlags& diff_flags = {})
+{
+	int n_y = 3 + n_theta;
+	int n_x = (diff_flags.rect_r_mean ? 1 : 0) + (diff_flags.rect_width ? 1 : 0) + (diff_flags.n_r ? 1 : 0) + (diff_flags.n_i ? 1 : 0);
+
+	y_val.resize(n_y);
+	Eigen::MatrixXd Jacobian = Eigen::MatrixXd::Zero(n_y, n_x);
+	autodiff::dual<double> wl_ad(wavelength, 0.0);
+
+	auto run_pass = [&](double rm_s, double rw_s, double nr_s, double ni_s, int col)
+	{
+		autodiff::dual<double> rm_ad(r_mean, rm_s);
+		autodiff::dual<double> rw_ad(width, rw_s);
+		autodiff::dual<double> m_re_ad(index.real(), nr_s);
+		autodiff::dual<double> m_im_ad(index.imag(), ni_s);
+		autodiff::complex<autodiff::dual<double>> index_ad(m_re_ad, m_im_ad);
+
+		auto sd = generateRectangularSizeDistribution(n_radius, rm_ad, rw_ad);
+		autodiff::dual<double> scs, acs, ecs;
+		std::vector<std::vector<autodiff::dual<double>>> P;
+		computeMieScatteringSizeDistribution(n_theta, wl_ad, sd[1], index_ad, scs, acs, ecs, P);
+
+		if (col <= 0)
+		{
+			y_val(0) = scs.val;
+			y_val(1) = acs.val;
+			y_val(2) = ecs.val;
+
+			for (int i = 0; i < n_theta; ++i)
+			{
+				y_val(3 + i) = P[i][1].val;
+			}
+		}
+
+		if (col >= 0)
+		{
+			Jacobian(0, col) = scs.der;
+			Jacobian(1, col) = acs.der;
+			Jacobian(2, col) = ecs.der;
+
+			for (int i = 0; i < n_theta; ++i)
+			{
+				Jacobian(3 + i, col) = P[i][1].der;
+			}
+		}
+	};
+
+	if (n_x == 0)
+	{
+		run_pass(0.0, 0.0, 0.0, 0.0, -1);
+		
+		return Jacobian;
+	}
+
+	int c = 0;
+
+	if (diff_flags.rect_r_mean)
+	{
+		run_pass(1.0, 0.0, 0.0, 0.0, c++);
+	}
+
+	if (diff_flags.rect_width)
+	{
+		run_pass(0.0, 1.0, 0.0, 0.0, c++);
+	}
+
+	if (diff_flags.n_r)
+	{
+		run_pass(0.0, 0.0, 1.0, 0.0, c++);
+	}
+
+	if (diff_flags.n_i)
+	{
+		run_pass(0.0, 0.0, 0.0, 1.0, c++);
+	}
+
+
+	return Jacobian;
+}
+
+inline Eigen::MatrixXd computeGammaMieJacobian(int n_theta, int n_radius, double wavelength, double a, double b, std::complex<double> index, Eigen::VectorXd& y_val, const DiffFlags& diff_flags = {})
+{
+	int n_y = 3 + n_theta;
+	int n_x = (diff_flags.gd_a ? 1 : 0) + (diff_flags.gd_b ? 1 : 0) + (diff_flags.n_r ? 1 : 0) + (diff_flags.n_i ? 1 : 0);
+
+	y_val.resize(n_y);
+	Eigen::MatrixXd Jacobian = Eigen::MatrixXd::Zero(n_y, n_x);
+	autodiff::dual<double> wl_ad(wavelength, 0.0);
+
+	auto run_pass = [&](double a_s, double b_s, double nr_s, double ni_s, int col)
+	{
+		autodiff::dual<double> a_ad(a, a_s);
+		autodiff::dual<double> b_ad(b, b_s);
+		autodiff::dual<double> m_re_ad(index.real(), nr_s);
+		autodiff::dual<double> m_im_ad(index.imag(), ni_s);
+		autodiff::complex<autodiff::dual<double>> index_ad(m_re_ad, m_im_ad);
+
+		auto sd = generateGammaSizeDistribution(n_radius, a_ad, b_ad);
+		autodiff::dual<double> scs, acs, ecs;
+		std::vector<std::vector<autodiff::dual<double>>> P;
+		computeMieScatteringSizeDistribution(n_theta, wl_ad, sd[1], index_ad, scs, acs, ecs, P);
+
+		if (col <= 0)
+		{
+			y_val(0) = scs.val;
+			y_val(1) = acs.val;
+			y_val(2) = ecs.val;
+
+			for (int i = 0; i < n_theta; ++i)
+			{
+				y_val(3 + i) = P[i][1].val;
+			}
+		}
+
+		if (col >= 0)
+		{
+			Jacobian(0, col) = scs.der; 
+			Jacobian(1, col) = acs.der;
+			Jacobian(2, col) = ecs.der;
+
+			for (int i = 0; i < n_theta; ++i)
+			{
+				Jacobian(3 + i, col) = P[i][1].der;
+			}
+		}
+	};
+
+	if (n_x == 0)
+	{
+		run_pass(0.0, 0.0, 0.0, 0.0, -1);
+		
+		return Jacobian;
+	}
+
+	int c = 0;
+
+	if (diff_flags.gd_a)
+	{
+		run_pass(1.0, 0.0, 0.0, 0.0, c++);
+	}
+
+	if (diff_flags.gd_b)
+	{
+		run_pass(0.0, 1.0, 0.0, 0.0, c++);
+	}
+
+	if (diff_flags.n_r)
+	{
+		run_pass(0.0, 0.0, 1.0, 0.0, c++);
+	}
+
+	if (diff_flags.n_i)
+	{
+		run_pass(0.0, 0.0, 0.0, 1.0, c++);
 	}
 
 	return Jacobian;
 }
 
-inline Eigen::MatrixXd computeRectangularMieJacobian(int n_theta, double wavelength, double r_mean, double width, std::complex<double> index, Eigen::VectorXd& y_val)
+inline Eigen::MatrixXd computeModifiedGammaMieJacobian(int n_theta, int n_radius, double wavelength, double r_c, double alpha, double gamma, std::complex<double> index, Eigen::VectorXd& y_val, const DiffFlags& diff_flags = {})
 {
-	Eigen::MatrixXd Jacobian;
-
-	autodiff::dual<double> wl_ad(wavelength, 0.0); 
-	autodiff::complex<autodiff::dual<double>> index_ad = index; 
-
 	int n_y = 3 + n_theta;
-	int n_x = 2;
+	int n_x = (diff_flags.mgd_r_c ? 1 : 0) + (diff_flags.mgd_alpha ? 1 : 0) + (diff_flags.mgd_gamma ? 1 : 0) + (diff_flags.n_r ? 1 : 0) + (diff_flags.n_i ? 1 : 0);
 
 	y_val.resize(n_y);
-	Jacobian.resize(n_y, n_x);
+	Eigen::MatrixXd Jacobian = Eigen::MatrixXd::Zero(n_y, n_x);
+	autodiff::dual<double> wl_ad(wavelength, 0.0);
 
-	autodiff::dual<double> r_mean_ad_1(r_mean, 1.0);
-	autodiff::dual<double> width_ad_1(width, 0.0);
-	
-	autodiff::dual<double> scs1, acs1, ecs1;
-	std::vector<std::vector<autodiff::dual<double>>> P1;
-
-	auto sd1 = generateRectangularSizeDistribution(n_theta, r_mean_ad_1, width_ad_1);
-	computeMieScatteringSizeDistribution(n_theta, wl_ad, sd1[1], index_ad, scs1, acs1, ecs1, P1);
-
-	y_val(0) = scs1.val;
-	y_val(1) = acs1.val;
-	y_val(2) = ecs1.val;
-
-	Jacobian(0, 0) = scs1.der;
-	Jacobian(1, 0) = acs1.der;
-	Jacobian(2, 0) = ecs1.der;
-
-	for(int i = 0; i < n_theta; ++i)
+	auto run_pass = [&](double rc_s, double al_s, double ga_s, double nr_s, double ni_s, int col)
 	{
-		y_val(3 + i) = P1[i][1].val;
-		Jacobian(3 + i, 0) = P1[i][1].der;
+		autodiff::dual<double> rc_ad(r_c, rc_s);
+		autodiff::dual<double> al_ad(alpha, al_s);
+		autodiff::dual<double> ga_ad(gamma, ga_s);
+		autodiff::dual<double> m_re_ad(index.real(), nr_s);
+		autodiff::dual<double> m_im_ad(index.imag(), ni_s);
+		autodiff::complex<autodiff::dual<double>> index_ad(m_re_ad, m_im_ad);
+
+		auto sd = generateModifiedGammaSizeDistribution(n_radius, rc_ad, al_ad, ga_ad);
+		autodiff::dual<double> scs, acs, ecs;
+		std::vector<std::vector<autodiff::dual<double>>> P;
+		computeMieScatteringSizeDistribution(n_theta, wl_ad, sd[1], index_ad, scs, acs, ecs, P);
+
+		if (col <= 0)
+		{
+			y_val(0) = scs.val;
+			y_val(1) = acs.val;
+			y_val(2) = ecs.val;
+
+			for (int i = 0; i < n_theta; ++i)
+			{
+				y_val(3 + i) = P[i][1].val;
+			}
+		}
+
+		if (col >= 0)
+		{
+			Jacobian(0, col) = scs.der;
+			Jacobian(1, col) = acs.der;
+			Jacobian(2, col) = ecs.der;
+
+			for (int i = 0; i < n_theta; ++i)
+			{
+				Jacobian(3 + i, col) = P[i][1].der;
+			}
+		}
+	};
+
+	if (n_x == 0)
+	{
+		run_pass(0.0, 0.0, 0.0, 0.0, 0.0, -1);
+		return Jacobian;
 	}
 
-	autodiff::dual<double> r_mean_ad_2(r_mean, 0.0);
-	autodiff::dual<double> width_ad_2(width, 1.0);
-	
-	autodiff::dual<double> scs2, acs2, ecs2;
-	std::vector<std::vector<autodiff::dual<double>>> P2;
+	int c = 0;
 
-	auto sd2 = generateRectangularSizeDistribution(n_theta, r_mean_ad_2, width_ad_2);
-	computeMieScatteringSizeDistribution(n_theta, wl_ad, sd2[1], index_ad, scs2, acs2, ecs2, P2);
-
-	Jacobian(0, 1) = scs2.der;
-	Jacobian(1, 1) = acs2.der;
-	Jacobian(2, 1) = ecs2.der;
-
-	for(int i = 0; i < n_theta; ++i)
+	if (diff_flags.mgd_r_c)
 	{
-		Jacobian(3 + i, 1) = P2[i][1].der;
+		run_pass(1.0, 0.0, 0.0, 0.0, 0.0, c++);
 	}
+
+	if (diff_flags.mgd_alpha)
+	{
+		run_pass(0.0, 1.0, 0.0, 0.0, 0.0, c++);
+	}
+
+	if (diff_flags.mgd_gamma)
+	{
+		run_pass(0.0, 0.0, 1.0, 0.0, 0.0, c++);
+	}
+
+	if (diff_flags.n_r)
+	{
+		run_pass(0.0, 0.0, 0.0, 1.0, 0.0, c++);
+	}
+
+	if (diff_flags.n_i)
+	{
+		run_pass(0.0, 0.0, 0.0, 0.0, 1.0, c++);
+	}
+
 
 	return Jacobian;
 }
 
-inline Eigen::MatrixXd computeGammaMieJacobian(int n_theta, double wavelength, double a, double b, std::complex<double> index, Eigen::VectorXd& y_val)
+inline Eigen::MatrixXd computePowerLawMieJacobian(int n_theta, int n_radius, double wavelength, double pl_delta, double pl_r1, double pl_r2, std::complex<double> index, Eigen::VectorXd& y_val, const DiffFlags& diff_flags = {})
 {
-	Eigen::MatrixXd Jacobian;
-
-	autodiff::dual<double> wl_ad(wavelength, 0.0); 
-	autodiff::complex<autodiff::dual<double>> index_ad = index; 
-
 	int n_y = 3 + n_theta;
-	int n_x = 2;
+	int n_x = (diff_flags.pld_delta ? 1 : 0) + (diff_flags.pld_r1 ? 1 : 0) + (diff_flags.pld_r2 ? 1 : 0) + (diff_flags.n_r ? 1 : 0) + (diff_flags.n_i ? 1 : 0);
 
 	y_val.resize(n_y);
-	Jacobian.resize(n_y, n_x);
+	Eigen::MatrixXd Jacobian = Eigen::MatrixXd::Zero(n_y, n_x);
+	autodiff::dual<double> wl_ad(wavelength, 0.0);
 
-	autodiff::dual<double> a_ad_1(a, 1.0);
-	autodiff::dual<double> b_ad_1(b, 0.0);
-	
-	autodiff::dual<double> scs1, acs1, ecs1;
-	std::vector<std::vector<autodiff::dual<double>>> P1;
-
-	auto sd1 = generateGammaSizeDistribution(n_theta, a_ad_1, b_ad_1);
-	computeMieScatteringSizeDistribution(n_theta, wl_ad, sd1[1], index_ad, scs1, acs1, ecs1, P1);
-
-	y_val(0) = scs1.val;
-	y_val(1) = acs1.val;
-	y_val(2) = ecs1.val;
-
-	Jacobian(0, 0) = scs1.der;
-	Jacobian(1, 0) = acs1.der;
-	Jacobian(2, 0) = ecs1.der;
-
-
-	for(int i = 0; i < n_theta; ++i)
+	auto run_pass = [&](double dl_s, double r1_s, double r2_s, double nr_s, double ni_s, int col)
 	{
-		y_val(3 + i) = P1[i][1].val;
-		Jacobian(3 + i, 0) = P1[i][1].der;
+		autodiff::dual<double> dl_ad(pl_delta, dl_s);
+		autodiff::dual<double> r1_ad(pl_r1, r1_s);
+		autodiff::dual<double> r2_ad(pl_r2, r2_s);
+		autodiff::dual<double> m_re_ad(index.real(), nr_s);
+		autodiff::dual<double> m_im_ad(index.imag(), ni_s);
+		autodiff::complex<autodiff::dual<double>> index_ad(m_re_ad, m_im_ad);
+
+		auto sd = generatePowerLawSizeDistribution(n_radius, dl_ad, r1_ad, r2_ad);
+		autodiff::dual<double> scs, acs, ecs;
+		std::vector<std::vector<autodiff::dual<double>>> P;
+		computeMieScatteringSizeDistribution(n_theta, wl_ad, sd[1], index_ad, scs, acs, ecs, P);
+
+		if (col <= 0)
+		{
+			y_val(0) = scs.val;
+			y_val(1) = acs.val;
+			y_val(2) = ecs.val;
+
+			for (int i = 0; i < n_theta; ++i)
+			{
+				y_val(3 + i) = P[i][1].val;
+			}
+		}
+
+		if (col >= 0)
+		{
+			Jacobian(0, col) = scs.der;
+			Jacobian(1, col) = acs.der;
+			Jacobian(2, col) = ecs.der;
+
+			for (int i = 0; i < n_theta; ++i)
+			{
+				Jacobian(3 + i, col) = P[i][1].der;
+			}
+		}
+	};
+
+	if (n_x == 0)
+	{
+		run_pass(0.0, 0.0, 0.0, 0.0, 0.0, -1);
+		return Jacobian;
+	}
+
+	int c = 0;
+
+	if (diff_flags.pld_delta)
+	{
+		run_pass(1.0, 0.0, 0.0, 0.0, 0.0, c++);
+	}
+
+	if (diff_flags.pld_r1)
+	{
+		run_pass(0.0, 1.0, 0.0, 0.0, 0.0, c++);
+	}
+
+	if (diff_flags.pld_r2)
+	{
+		run_pass(0.0, 0.0, 1.0, 0.0, 0.0, c++);
+	}
+
+	if (diff_flags.n_r)
+	{
+		run_pass(0.0, 0.0, 0.0, 1.0, 0.0, c++);
+	}
+
+	if (diff_flags.n_i)
+	{
+		run_pass(0.0, 0.0, 0.0, 0.0, 1.0, c++);
 	}
 	
-	autodiff::dual<double> a_ad_2(a, 0.0);
-	autodiff::dual<double> b_ad_2(b, 1.0);
-	
-	autodiff::dual<double> scs2, acs2, ecs2;
-	std::vector<std::vector<autodiff::dual<double>>> P2;
-
-	auto sd2 = generateGammaSizeDistribution(n_theta, a_ad_2, b_ad_2);
-	computeMieScatteringSizeDistribution(n_theta, wl_ad, sd2[1], index_ad, scs2, acs2, ecs2, P2);
-
-	Jacobian(0, 1) = scs2.der;
-	Jacobian(1, 1) = acs2.der;
-	Jacobian(2, 1) = ecs2.der;
-
-	for(int i = 0; i < n_theta; ++i)
-	{
-		Jacobian(3 + i, 1) = P2[i][1].der;
-	}
-
 	return Jacobian;
 }
 
-inline Eigen::MatrixXd computeModifiedGammaMieJacobian(int n_theta, double wavelength, double r_c, double alpha, double gamma, std::complex<double> index, Eigen::VectorXd& y_val)
-{
-	Eigen::MatrixXd Jacobian;
-
-	autodiff::dual<double> wl_ad(wavelength, 0.0); 
-	autodiff::complex<autodiff::dual<double>> index_ad = index; 
-
-	int n_y = 3 + n_theta;
-	int n_x = 3; 
-
-	y_val.resize(n_y);
-	Jacobian.resize(n_y, n_x);
-
-	autodiff::dual<double> rc_ad_1(r_c, 1.0);
-	autodiff::dual<double> alpha_ad_1(alpha, 0.0);
-	autodiff::dual<double> gamma_ad_1(gamma, 0.0);
-	
-	autodiff::dual<double> scs1, acs1, ecs1;
-	std::vector<std::vector<autodiff::dual<double>>> P1;
-
-	auto sd1 = generateModifiedGammaSizeDistribution(n_theta, rc_ad_1, alpha_ad_1, gamma_ad_1);
-	computeMieScatteringSizeDistribution(n_theta, wl_ad, sd1[1], index_ad, scs1, acs1, ecs1, P1);
-
-	y_val(0) = scs1.val;
-	y_val(1) = acs1.val;
-	y_val(2) = ecs1.val;
-
-	Jacobian(0, 0) = scs1.der;
-	Jacobian(1, 0) = acs1.der;
-	Jacobian(2, 0) = ecs1.der;
-
-	for(int i = 0; i < n_theta; ++i)
-	{
-		y_val(3 + i) = P1[i][1].val;
-		Jacobian(3 + i, 0) = P1[i][1].der;
-	}
-
-	autodiff::dual<double> rc_ad_2(r_c, 0.0);
-	autodiff::dual<double> alpha_ad_2(alpha, 1.0);
-	autodiff::dual<double> gamma_ad_2(gamma, 0.0);
-	
-	autodiff::dual<double> scs2, acs2, ecs2;
-	std::vector<std::vector<autodiff::dual<double>>> P2;
-
-	auto sd2 = generateModifiedGammaSizeDistribution(n_theta, rc_ad_2, alpha_ad_2, gamma_ad_2);
-	computeMieScatteringSizeDistribution(n_theta, wl_ad, sd2[1], index_ad, scs2, acs2, ecs2, P2);
-
-	Jacobian(0, 1) = scs2.der;
-	Jacobian(1, 1) = acs2.der;
-	Jacobian(2, 1) = ecs2.der;
-
-	for(int i = 0; i < n_theta; ++i)
-	{
-		Jacobian(3 + i, 1) = P2[i][1].der;
-	}
-
-	autodiff::dual<double> rc_ad_3(r_c, 0.0);
-	autodiff::dual<double> alpha_ad_3(alpha, 0.0);
-	autodiff::dual<double> gamma_ad_3(gamma, 1.0);
-	
-	autodiff::dual<double> scs3, acs3, ecs3;
-	std::vector<std::vector<autodiff::dual<double>>> P3;
-
-	auto sd3 = generateModifiedGammaSizeDistribution(n_theta, rc_ad_3, alpha_ad_3, gamma_ad_3);
-	computeMieScatteringSizeDistribution(n_theta, wl_ad, sd3[1], index_ad, scs3, acs3, ecs3, P3);
-
-	Jacobian(0, 2) = scs3.der;
-	Jacobian(1, 2) = acs3.der;
-	Jacobian(2, 2) = ecs3.der;
-
-	for(int i = 0; i < n_theta; ++i)
-	{
-		Jacobian(3 + i, 2) = P3[i][1].der;
-	}
-
-	return Jacobian;
-}
-
-inline Eigen::MatrixXd computePowerLawMieJacobian(int n_theta, double wavelength, double pl_delta, double pl_r1, double pl_r2, std::complex<double> index, Eigen::VectorXd& y_val)
-{
-	Eigen::MatrixXd Jacobian;
-
-	autodiff::dual<double> wl_ad(wavelength, 0.0); 
-	autodiff::complex<autodiff::dual<double>> index_ad = index; 
-
-	int n_y = 3 + n_theta;
-	int n_x = 3;
-
-	y_val.resize(n_y);
-	Jacobian.resize(n_y, n_x);
-
-	autodiff::dual<double> delta_ad_1(pl_delta, 1.0);
-	autodiff::dual<double> r1_ad_1(pl_r1, 0.0);
-	autodiff::dual<double> r2_ad_1(pl_r2, 0.0);
-	
-	autodiff::dual<double> scs1, acs1, ecs1;
-	std::vector<std::vector<autodiff::dual<double>>> P1;
-
-	auto sd1 = generatePowerLawSizeDistribution(n_theta, delta_ad_1, r1_ad_1, r2_ad_1);
-	computeMieScatteringSizeDistribution(n_theta, wl_ad, sd1[1], index_ad, scs1, acs1, ecs1, P1);
-
-	y_val(0) = scs1.val; 
-	y_val(1) = acs1.val; 
-	y_val(2) = ecs1.val;
-
-	Jacobian(0, 0) = scs1.der;
-	Jacobian(1, 0) = acs1.der;
-	Jacobian(2, 0) = ecs1.der;
-
-	for(int i = 0; i < n_theta; ++i)
-	{
-		y_val(3 + i) = P1[i][1].val;
-		Jacobian(3 + i, 0) = P1[i][1].der;
-	}
-
-	autodiff::dual<double> delta_ad_2(pl_delta, 0.0);
-	autodiff::dual<double> r1_ad_2(pl_r1, 1.0);
-	autodiff::dual<double> r2_ad_2(pl_r2, 0.0);
-	
-	autodiff::dual<double> scs2, acs2, ecs2;
-	std::vector<std::vector<autodiff::dual<double>>> P2;
-
-	auto sd2 = generatePowerLawSizeDistribution(n_theta, delta_ad_2, r1_ad_2, r2_ad_2);
-	computeMieScatteringSizeDistribution(n_theta, wl_ad, sd2[1], index_ad, scs2, acs2, ecs2, P2);
-
-	Jacobian(0, 1) = scs2.der;
-	Jacobian(1, 1) = acs2.der;
-	Jacobian(2, 1) = ecs2.der;
-
-	for(int i = 0; i < n_theta; ++i)
-	{
-		Jacobian(3 + i, 1) = P2[i][1].der;
-	}
-
-	autodiff::dual<double> delta_ad_3(pl_delta, 0.0);
-	autodiff::dual<double> r1_ad_3(pl_r1, 0.0);
-	autodiff::dual<double> r2_ad_3(pl_r2, 1.0);
-	
-	autodiff::dual<double> scs3, acs3, ecs3;
-	std::vector<std::vector<autodiff::dual<double>>> P3;
-
-	auto sd3 = generatePowerLawSizeDistribution(n_theta, delta_ad_3, r1_ad_3, r2_ad_3);
-	computeMieScatteringSizeDistribution(n_theta, wl_ad, sd3[1], index_ad, scs3, acs3, ecs3, P3);
-
-	Jacobian(0, 2) = scs3.der;
-	Jacobian(1, 2) = acs3.der;
-	Jacobian(2, 2) = ecs3.der;
-
-	for(int i = 0; i < n_theta; ++i)
-	{
-		Jacobian(3 + i, 2) = P3[i][1].der;
-	}
-
-	return Jacobian;
 }
