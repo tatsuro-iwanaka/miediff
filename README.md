@@ -15,7 +15,7 @@ Designed for researchers in planetary science and atmospheric physics, it provid
 
 ## Dependencies
 * **C++20** or higher.
-* [**Eigen**] (for linear algebra).
+* **Eigen** (for linear algebra).
 * [**autodiff**](https://github.com/tatsuro-iwanaka/autodiff) (the automatic differentiation engine).
 
 
