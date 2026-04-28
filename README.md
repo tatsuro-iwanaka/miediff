@@ -4,7 +4,7 @@
 Designed for researchers in planetary science and atmospheric physics, it provides a bases for aerosol and dust inversion solvers. Miediff calculates precious sensitivity matrices (Jacobians) by using AD.
 
 
-## Key Features
+## Features
 
 * **Exact Jacobians**: Utilizes the `autodiff` library to extract precisious derivatives of scattering properties with respect to refractive index and size distribution parameters.
 * **Diverse Size Distributions**: Built-in support for Delta (Single Particle), Log-normal, Gamma, Modified Gamma, Rectangular, and Power-law distributions.
