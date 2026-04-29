@@ -10,6 +10,63 @@
 namespace miediff
 {
 
+struct DiffFlags
+{
+	// Delta (Single Particle)
+	bool delta_r = true;
+
+	// Log-Normal
+	bool lnd_r_g = true;
+	bool lnd_sigma_g = true;
+
+	// Rectangular
+	bool rect_r_mean = true;
+	bool rect_width = true;
+
+	// Gamma
+	bool gd_a = true;
+	bool gd_b = true;
+
+	// Modified Gamma
+	bool mgd_r_c = true;
+	bool mgd_alpha = true;
+	bool mgd_gamma = true;
+
+	// Power Law
+	bool pld_delta = true;
+	bool pld_r1 = true;
+	bool pld_r2 = true;
+
+	// Refractive Index
+	bool n_r = false;
+	bool n_i = false;
+};
+
+std::vector<std::vector<double>> computeGaussLegendreQuadratureNodeWeight(int);
+std::vector<std::vector<double>> computeGaussHermiteQuadratureNodeWeight(int);
+std::vector<std::vector<double>> computeGaussLaguerreQuadratureNodeWeight(int);
+std::vector<std::vector<double>> computeGeneralizedGaussLaguerreQuadratureNodeWeight(int, double);
+template <typename T> T computeSimpsonIntegration(const std::vector<std::vector<T>>&);
+template <typename T> void normalizeScatteringPhaseFunction(std::vector<std::vector<T>>&);
+template <typename T> void computeMieScattering(int, T, T, autodiff::complex<T>, T&, T&, T&, std::vector<std::vector<T>>&);
+template <typename T> void computeMieScatteringSizeDistribution(int, T, const std::vector<std::vector<T>>&, autodiff::complex<T>, T&, T&, T&, std::vector<std::vector<T>>&);
+template <typename T> std::vector<std::vector<std::vector<T>>> generateRectangularSizeDistribution(int, T, T);
+template <typename T> std::vector<std::vector<std::vector<T>>> generateLogNormalSizeDistribution(int, T, T);
+template <typename T> std::vector<std::vector<std::vector<T>>> generateGammaSizeDistribution(int, T, T);
+template <typename T> std::vector<std::vector<std::vector<T>>> generateModifiedGammaSizeDistribution(int, T, T, T);
+template <typename T> std::vector<std::vector<std::vector<T>>> generatePowerLawSizeDistribution(int, T, T, T);
+template <typename T> void computeDeltaMieScattering(int, T r, T, autodiff::complex<T>, T&, T&, T&, std::vector<std::vector<T>>&);
+template <typename T> void computeRectangularMieScattering(int, int, T, T, T, autodiff::complex<T>, T&, T&, T&, std::vector<std::vector<T>>&);
+template <typename T> void computeLogNormalMieScattering(int, int, T, T, T, autodiff::complex<T>, T&, T&, T&, std::vector<std::vector<T>>&);
+template <typename T> void computeGammaMieScattering(int, int, T, T, T, autodiff::complex<T>, T&, T&, T&, std::vector<std::vector<T>>&);
+template <typename T> void computeModifiedGammaMieScattering(int, int, T, T, T, T, autodiff::complex<T>, T&, T&, T&, std::vector<std::vector<T>>&);
+template <typename T> void computePowerLawMieScattering(int, int, T, T, T, T, autodiff::complex<T>, T&, T&, T&, std::vector<std::vector<T>>&);
+Eigen::MatrixXd computeDeltaMieJacobian(int, double, double, std::complex<double>, Eigen::VectorXd&, const DiffFlags&);
+Eigen::MatrixXd computeLogNormalMieJacobian(int, int, double, double, double, std::complex<double>, Eigen::VectorXd&, const DiffFlags&);
+Eigen::MatrixXd computeGammaMieJacobian(int, int, double, double, double, std::complex<double>, Eigen::VectorXd&, const DiffFlags&);
+Eigen::MatrixXd computeModifiedGammaMieJacobian(int, int, double, double, double, double, std::complex<double>, Eigen::VectorXd&, const DiffFlags&);
+Eigen::MatrixXd computePowerLawMieJacobian(int, int, double, double, double, double, std::complex<double>, Eigen::VectorXd&, const DiffFlags&);
+
 inline std::vector<std::vector<double>> computeGaussLegendreQuadratureNodeWeight(int degree)
 {
 	Eigen::MatrixXd J = Eigen::MatrixXd::Zero(degree, degree);
@@ -224,7 +281,7 @@ template <typename T> inline T computeSimpsonIntegration(const std::vector<std::
 	return result;
 }
 
-template <typename T> inline void normalizeScatteringPhaseFunction(std::vector<std::vector<T>> &f)
+template <typename T> inline void normalizeScatteringPhaseFunction(std::vector<std::vector<T>>& f)
 {
 	using std::sin; using autodiff::sin;
 
@@ -696,37 +753,41 @@ template <typename T> inline std::vector<std::vector<std::vector<T>>> generatePo
 	return {size_distribution, weight};
 }
 
-struct DiffFlags
+template <typename T> inline void computeDeltaMieScattering(int n_theta, T r, T wavelength, autodiff::complex<T> index, T& scattering_cross_section, T& absorption_cross_section, T& extinction_cross_section, std::vector<std::vector<T>>& phase_function)
 {
-	// Delta (Single Particle)
-	bool delta_r = true;
+	computeMieScattering(n_theta, r, wavelength, index, scattering_cross_section, absorption_cross_section, extinction_cross_section, phase_function);
+	normalizeScatteringPhaseFunction(phase_function);
+}
 
-	// Log-Normal
-	bool lnd_r_g = true;
-	bool lnd_sigma_g = true;
+template <typename T> inline void computeRectangularMieScattering(int n_theta, int n_r, T r_mean, T width, T wavelength, autodiff::complex<T> index, T& scattering_cross_section, T& absorption_cross_section, T& extinction_cross_section, std::vector<std::vector<T>>& phase_function)
+{
+	auto results = generateRectangularSizeDistribution(n_r, r_mean, width);
+	computeMieScatteringSizeDistribution(n_theta, wavelength, results[1], index, scattering_cross_section, absorption_cross_section, extinction_cross_section, phase_function);
+}
 
-	// Rectangular
-	bool rect_r_mean = true;
-	bool rect_width = true;
+template <typename T> inline void computeLogNormalMieScattering(int n_theta, int n_r, T r_g, T sigma_g, T wavelength, autodiff::complex<T> index, T& scattering_cross_section, T& absorption_cross_section, T& extinction_cross_section, std::vector<std::vector<T>>& phase_function)
+{
+	auto results = generateLogNormalSizeDistribution(n_r, r_g, sigma_g);
+	computeMieScatteringSizeDistribution(n_theta, wavelength, results[1], index, scattering_cross_section, absorption_cross_section, extinction_cross_section, phase_function);
+}
 
-	// Gamma
-	bool gd_a = true;
-	bool gd_b = true;
+template <typename T> inline void computeGammaMieScattering(int n_theta, int n_r, T a, T b, T wavelength, autodiff::complex<T> index, T& scattering_cross_section, T& absorption_cross_section, T& extinction_cross_section, std::vector<std::vector<T>>& phase_function)
+{
+	auto results = generateGammaSizeDistribution(n_r, a, b);
+	computeMieScatteringSizeDistribution(n_theta, wavelength, results[1], index, scattering_cross_section, absorption_cross_section, extinction_cross_section, phase_function);
+}
 
-	// Modified Gamma
-	bool mgd_r_c = true;
-	bool mgd_alpha = true;
-	bool mgd_gamma = true;
+template <typename T> inline void computeModifiedGammaMieScattering(int n_theta, int n_r, T r_c, T alpha, T gamma, T wavelength, autodiff::complex<T> index, T& scattering_cross_section, T& absorption_cross_section, T& extinction_cross_section, std::vector<std::vector<T>>& phase_function)
+{
+	auto results = generateModifiedGammaSizeDistribution(n_r, r_c, alpha, gamma);
+	computeMieScatteringSizeDistribution(n_theta, wavelength, results[1], index, scattering_cross_section, absorption_cross_section, extinction_cross_section, phase_function);
+}
 
-	// Power Law
-	bool pld_delta = true;
-	bool pld_r1 = true;
-	bool pld_r2 = true;
-
-	// Refractive Index
-	bool n_r = false;
-	bool n_i = false;
-};
+template <typename T> inline void computePowerLawMieScattering(int n_theta, int n_r, T pl_delta, T pl_r1, T pl_r2, T wavelength, autodiff::complex<T> index, T& scattering_cross_section, T& absorption_cross_section, T& extinction_cross_section, std::vector<std::vector<T>>& phase_function)
+{
+	auto results = generatePowerLawSizeDistribution(n_r, pl_delta, pl_r1, pl_r2);
+	computeMieScatteringSizeDistribution(n_theta, wavelength, results[1], index, scattering_cross_section, absorption_cross_section, extinction_cross_section, phase_function);
+}
 
 inline Eigen::MatrixXd computeDeltaMieJacobian(int n_theta, double wavelength, double r, std::complex<double> index, Eigen::VectorXd& y_val, const DiffFlags& diff_flags = {})
 {
